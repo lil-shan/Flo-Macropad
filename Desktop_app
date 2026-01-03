@@ -1,0 +1,637 @@
+import tkinter as tk
+from tkinter import font, ttk
+import serial
+import serial.tools.list_ports
+import time
+import threading
+
+
+class FloMacroPad:
+    def __init__(self, master):
+        self.master = master
+        master.title("Flo – C3 Macropad Configurator")
+        master.configure(bg="#121212")
+        master.resizable(False, False)
+
+        # 4:3 window size
+        self.master.geometry("960x720")  # width x height
+
+        # Color palette (dark theme)
+        self.bg_main = "#121212"
+        self.bg_card = "#1E1E1E"
+        self.border_color = "#2A2A2A"
+        self.accent_yellow = "#FFC857"
+        self.accent_white = "#F5F5F5"
+        self.text_muted = "#9E9E9E"
+
+        # Fonts
+        try:
+            self.heading_font = font.Font(family="Segoe UI", size=16, weight="bold")
+            self.subheading_font = font.Font(family="Segoe UI", size=10, weight="bold")
+            self.body_font = font.Font(family="Segoe UI", size=9)
+            self.small_font = font.Font(family="Segoe UI", size=8)
+        except Exception:
+            # Fallback
+            self.heading_font = ("Arial", 16, "bold")
+            self.subheading_font = ("Arial", 10, "bold")
+            self.body_font = ("Arial", 9)
+            self.small_font = ("Arial", 8)
+
+        self.com_port = None
+        self.is_connected = False
+
+        # Configure ttk style for a modern dark look
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(
+            "TCombobox",
+            fieldbackground=self.bg_card,
+            background=self.bg_card,
+            foreground=self.accent_white
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", self.bg_card)],
+            foreground=[("readonly", self.accent_white)]
+        )
+
+        self.create_ui()
+        self.master.after(500, self.auto_detect)
+
+    # ---------- UI Helpers ----------
+    def card_frame(self, parent, **kwargs):
+        frame = tk.Frame(
+            parent,
+            bg=self.bg_card,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+            **kwargs
+        )
+        frame.configure(highlightbackground=self.border_color)
+        return frame
+
+    def clean_button(self, parent, text, command, primary=False, full_width=False):
+        # Button colors
+        bg_normal = self.accent_yellow if primary else "#2C2C2C"
+        fg_normal = "#000000" if primary else self.accent_white
+
+        bg_hover = "#FFD778" if primary else "#3A3A3A"
+        fg_hover = "#000000" if primary else self.accent_white
+
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            font=self.body_font,
+            bg=bg_normal,
+            fg=fg_normal,
+            activebackground=bg_hover,
+            activeforeground=fg_hover,
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=10,
+            cursor="hand2",
+        )
+
+        def on_enter(e):
+            btn.config(bg=bg_hover, fg=fg_hover)
+
+        def on_leave(e):
+            btn.config(bg=bg_normal, fg=fg_normal)
+
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+
+        return btn
+
+    def clean_entry(self, parent, placeholder):
+        entry = tk.Entry(
+            parent,
+            font=self.body_font,
+            bg=self.bg_card,
+            fg=self.text_muted,
+            insertbackground=self.accent_white,
+            relief="flat",
+            bd=0,
+        )
+        entry.insert(0, placeholder)
+        entry.bind("<FocusIn>", lambda e: self.clear_placeholder(entry, placeholder))
+        entry.bind("<FocusOut>", lambda e: self.restore_placeholder(entry, placeholder))
+
+        underline = tk.Frame(parent, bg=self.border_color, height=1)
+        return entry, underline
+
+    def clear_placeholder(self, entry, placeholder):
+        if entry.get() == placeholder:
+            entry.delete(0, tk.END)
+            entry.config(fg=self.accent_white)
+
+    def restore_placeholder(self, entry, placeholder):
+        if entry.get() == "":
+            entry.insert(0, placeholder)
+            entry.config(fg=self.text_muted)
+
+    # ---------- UI Layout ----------
+    def create_ui(self):
+        # Main container
+        main = tk.Frame(self.master, bg=self.bg_main)
+        main.pack(fill="both", expand=True, padx=24, pady=24)
+
+        # Top: Header
+        header = tk.Frame(main, bg=self.bg_main)
+        header.pack(fill="x", pady=(0, 20))
+
+        title_label = tk.Label(
+            header,
+            text="Flo",
+            font=font.Font(family="Segoe UI", size=26, weight="bold"),
+            bg=self.bg_main,
+            fg=self.accent_yellow,
+        )
+        title_label.pack(pady=(10, 0))
+
+        underline = tk.Frame(header, bg=self.accent_yellow, height=3, width=80)
+        underline.pack(pady=(4, 8))
+
+        subtitle_label = tk.Label(
+            header,
+            text="C3 Macropad Configurator",
+            font=self.subheading_font,
+            bg=self.bg_main,
+            fg=self.accent_white,
+        )
+        subtitle_label.pack()
+
+        # Row: connection + message
+        top_row = tk.Frame(main, bg=self.bg_main)
+        top_row.pack(fill="x", pady=(8, 16))
+
+        # Connection card
+        conn_card = self.card_frame(top_row, padx=16, pady=12)
+        conn_card.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self.status_label = tk.Label(
+            conn_card,
+            text="Initializing…",
+            font=self.small_font,
+            bg=self.bg_card,
+            fg=self.accent_white,
+        )
+        self.status_label.grid(row=0, column=0, columnspan=4, sticky="w")
+
+        # Port label
+        tk.Label(
+            conn_card,
+            text="Port",
+            font=self.small_font,
+            bg=self.bg_card,
+            fg=self.text_muted,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        self.port_var = tk.StringVar()
+        self.port_combo = ttk.Combobox(
+            conn_card,
+            textvariable=self.port_var,
+            font=self.body_font,
+            width=20,
+            state="readonly",
+        )
+        self.port_combo.grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+        refresh_btn = self.clean_button(
+            conn_card, "Refresh", self.refresh_ports, primary=False
+        )
+        refresh_btn.grid(row=2, column=1, padx=(8, 0), pady=(2, 0))
+
+        self.connect_btn = self.clean_button(
+            conn_card, "Connect", self.manual_connect, primary=True
+        )
+        self.connect_btn.grid(row=2, column=2, padx=(8, 0), pady=(2, 0))
+
+        # Message card
+        msg_card = self.card_frame(top_row, padx=16, pady=12)
+        msg_card.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        self.message_label = tk.Label(
+            msg_card,
+            text="",
+            font=self.small_font,
+            bg=self.bg_card,
+            fg=self.text_muted,
+            justify="left",
+            wraplength=400,
+        )
+        self.message_label.pack(anchor="w")
+
+        self.message_card = msg_card  # for access
+
+        # Middle: macro fields + builder
+        mid_row = tk.Frame(main, bg=self.bg_main)
+        mid_row.pack(fill="both", expand=True)
+
+        # Macro card (left)
+        macro_card = self.card_frame(mid_row, padx=16, pady=16)
+        macro_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        tk.Label(
+            macro_card,
+            text="Macros",
+            font=self.subheading_font,
+            bg=self.bg_card,
+            fg=self.accent_white,
+        ).grid(row=0, column=0, sticky="w")
+
+        # Macro entries
+        self.entry1, u1 = self.clean_entry(macro_card, "Macro 1 (Button 1)…")
+        self.entry2, u2 = self.clean_entry(macro_card, "Macro 2 (Button 2)…")
+        self.entry3, u3 = self.clean_entry(macro_card, "Macro 3 (Button 3)…")
+        self.entry4, u4 = self.clean_entry(macro_card, "Macro 4 (Encoder press)…")
+
+        row = 1
+        for label_text, entry, underline_entry in [
+            ("Button 1", self.entry1, u1),
+            ("Button 2", self.entry2, u2),
+            ("Button 3", self.entry3, u3),
+            ("Encoder press", self.entry4, u4),
+        ]:
+            tk.Label(
+                macro_card,
+                text=label_text,
+                font=self.small_font,
+                bg=self.bg_card,
+                fg=self.text_muted,
+            ).grid(row=row, column=0, sticky="w", pady=(10 if row > 1 else 8, 0))
+            row += 1
+            entry.grid(row=row, column=0, sticky="we", pady=(2, 0))
+            row += 1
+            underline_entry.grid(row=row, column=0, sticky="we")
+            row += 1
+
+        macro_card.grid_columnconfigure(0, weight=1)
+
+        # Macro builder (right)
+        builder_card = self.card_frame(mid_row, padx=16, pady=16)
+        builder_card.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        tk.Label(
+            builder_card,
+            text="Macro builder",
+            font=self.subheading_font,
+            bg=self.bg_card,
+            fg=self.accent_white,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        tk.Label(
+            builder_card,
+            text="Target macro",
+            font=self.small_font,
+            bg=self.bg_card,
+            fg=self.text_muted,
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+        self.builder_target_var = tk.StringVar(value="Macro 1")
+        self.builder_target_combo = ttk.Combobox(
+            builder_card,
+            textvariable=self.builder_target_var,
+            values=["Macro 1", "Macro 2", "Macro 3", "Macro 4"],
+            state="readonly",
+            width=14,
+        )
+        self.builder_target_combo.grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+        # Modifiers
+        tk.Label(
+            builder_card,
+            text="Modifiers",
+            font=self.small_font,
+            bg=self.bg_card,
+            fg=self.text_muted,
+        ).grid(row=3, column=0, sticky="w", pady=(12, 0))
+
+        mods_frame = tk.Frame(builder_card, bg=self.bg_card)
+        mods_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.mod_ctrl = tk.BooleanVar()
+        self.mod_alt = tk.BooleanVar()
+        self.mod_shift = tk.BooleanVar()
+        self.mod_win = tk.BooleanVar()
+
+        for idx, (label, var) in enumerate(
+            [
+                ("Ctrl", self.mod_ctrl),
+                ("Alt", self.mod_alt),
+                ("Shift", self.mod_shift),
+                ("Win", self.mod_win),
+            ]
+        ):
+            cb = tk.Checkbutton(
+                mods_frame,
+                text=label,
+                variable=var,
+                font=self.small_font,
+                bg=self.bg_card,
+                fg=self.accent_white,
+                activebackground=self.bg_card,
+                activeforeground=self.accent_white,
+                selectcolor=self.bg_main,
+                highlightthickness=0,
+                bd=0,
+                padx=4,
+            )
+            cb.grid(row=0, column=idx, padx=(0 if idx == 0 else 8, 0))
+
+        # Key field
+        tk.Label(
+            builder_card,
+            text="Key (e.g. c, v, tab, esc, f4)",
+            font=self.small_font,
+            bg=self.bg_card,
+            fg=self.text_muted,
+        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+
+        self.builder_key_entry = tk.Entry(
+            builder_card,
+            font=self.body_font,
+            bg=self.bg_card,
+            fg=self.accent_white,
+            insertbackground=self.accent_white,
+            relief="flat",
+            bd=0,
+        )
+        self.builder_key_entry.grid(row=6, column=0, sticky="we", pady=(2, 0))
+        builder_underline = tk.Frame(builder_card, bg=self.border_color, height=1)
+        builder_underline.grid(row=7, column=0, sticky="we")
+
+        # Apply button
+        apply_btn = self.clean_button(
+            builder_card,
+            "Apply to target macro",
+            self.apply_macro_builder,
+            primary=False,
+        )
+        apply_btn.grid(row=8, column=0, sticky="w", pady=(16, 0))
+
+        builder_card.grid_columnconfigure(0, weight=1)
+
+        # Bottom: send button
+        bottom = tk.Frame(main, bg=self.bg_main)
+        bottom.pack(fill="x", pady=(16, 0))
+
+        self.send_btn = self.clean_button(
+            bottom,
+            "Send macros to device",
+            self.send_macros,
+            primary=True,
+        )
+        self.send_btn.pack(fill="x")
+        self.send_btn.config(state="disabled")
+
+        # Footer
+        footer = tk.Frame(main, bg=self.bg_main)
+        footer.pack(fill="x", pady=(8, 0))
+
+        footer_label = tk.Label(
+            footer,
+            text="Flo macropad config • v1.2",
+            font=self.small_font,
+            bg=self.bg_main,
+            fg=self.text_muted,
+        )
+        footer_label.pack(anchor="e")
+
+        self.refresh_ports()
+
+    # ---------- Ports & Connection ----------
+    def refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo["values"] = ports
+        if ports:
+            self.port_combo.current(0)
+            self.show_message(f"Found {len(ports)} port(s).", "info")
+        else:
+            self.show_message("No ports found. Connect your device.", "error")
+
+    def manual_connect(self):
+        selected_port = self.port_var.get()
+        if not selected_port:
+            self.show_message("Please select a port.", "error")
+            return
+
+        self.status_label.config(text="Connecting…", fg=self.accent_white)
+        self.master.update()
+
+        thread = threading.Thread(
+            target=self._manual_connect_thread, args=(selected_port,), daemon=True
+        )
+        thread.start()
+
+    def _manual_connect_thread(self, port):
+        try:
+            with serial.Serial(port, 115200, timeout=2) as ser:
+                time.sleep(0.2)
+                ser.write(b"HELLO\n")
+                time.sleep(0.5)
+
+                for _ in range(3):
+                    if ser.in_waiting > 0:
+                        response = (
+                            ser.readline()
+                            .decode("utf-8", errors="ignore")
+                            .strip()
+                        )
+                        print("Response:", response)
+                        if "ESP32-C3-READY" in response or "C3 MacroPad" in response:
+                            self.com_port = port
+                            self.is_connected = True
+                            self.master.after(
+                                0, self._on_device_found, port
+                            )
+                            return
+                    time.sleep(0.2)
+
+                # Fallback: no handshake but port is valid
+                self.com_port = port
+                self.is_connected = True
+                self.master.after(0, self._on_device_found_fallback, port)
+
+        except Exception as e:
+            self.master.after(0, self._on_connection_error, str(e))
+
+    def _on_device_found(self, port_name):
+        self.status_label.config(
+            text=f"Connected: {port_name}", fg=self.accent_yellow
+        )
+        self.show_message("Device detected and ready.", "success")
+        self.send_btn.config(state="normal")
+        self.port_var.set(port_name)
+
+    def _on_device_found_fallback(self, port_name):
+        self.status_label.config(
+            text=f"Connected (no handshake): {port_name}",
+            fg=self.accent_white,
+        )
+        self.show_message(
+            "Connected (no handshake). You can still try sending macros.",
+            "info",
+        )
+        self.send_btn.config(state="normal")
+        self.port_var.set(port_name)
+
+    def _on_connection_error(self, error):
+        self.status_label.config(text="Connection failed.", fg="#FF6B6B")
+        self.show_message(f"Connection error: {error}", "error")
+
+    def auto_detect(self):
+        self.status_label.config(text="Scanning ports…", fg=self.accent_white)
+        self.master.update()
+
+        thread = threading.Thread(target=self._detect_thread, daemon=True)
+        thread.start()
+
+    def _detect_thread(self):
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            try:
+                with serial.Serial(port.device, 115200, timeout=2) as ser:
+                    time.sleep(0.2)
+                    ser.write(b"HELLO\n")
+                    time.sleep(0.5)
+
+                    for _ in range(3):
+                        if ser.in_waiting > 0:
+                            response = (
+                                ser.readline()
+                                .decode("utf-8", errors="ignore")
+                                .strip()
+                            )
+                            if "ESP32-C3-READY" in response:
+                                self.com_port = port.device
+                                self.is_connected = True
+                                self.master.after(
+                                    0, self._on_device_found, port.device
+                                )
+                                return
+                        time.sleep(0.2)
+            except Exception:
+                continue
+
+        self.master.after(0, self._on_device_not_found)
+
+    def _on_device_not_found(self):
+        self.status_label.config(text="No device detected.", fg="#FF6B6B")
+        self.show_message(
+            "Auto-detect failed. Select a port manually and click Connect.",
+            "error",
+        )
+
+    # ---------- Messaging ----------
+    def show_message(self, text, level="info"):
+        if level == "success":
+            color = self.accent_yellow
+        elif level == "error":
+            color = "#FF6B6B"
+        else:
+            color = self.text_muted
+
+        self.message_label.config(text=text, fg=color)
+
+    # ---------- Macro Handling ----------
+    def get_macro_value(self, entry, placeholder):
+        val = entry.get().strip()
+        return "" if val == placeholder else val
+
+    def apply_macro_builder(self):
+        key = self.builder_key_entry.get().strip()
+        if not key:
+            self.show_message(
+                "Enter a key for the macro (e.g. c, v, tab, esc, f4).",
+                "error",
+            )
+            return
+
+        parts = []
+        if self.mod_ctrl.get():
+            parts.append("ctrl")
+        if self.mod_alt.get():
+            parts.append("alt")
+        if self.mod_shift.get():
+            parts.append("shift")
+        if self.mod_win.get():
+            parts.append("win")  # Firmware should treat "win+" as GUI key
+
+        parts.append(key.lower())
+        macro_str = "+".join(parts)
+
+        target = self.builder_target_var.get()
+        if target == "Macro 1":
+            self.entry1.delete(0, tk.END)
+            self.entry1.config(fg=self.accent_white)
+            self.entry1.insert(0, macro_str)
+        elif target == "Macro 2":
+            self.entry2.delete(0, tk.END)
+            self.entry2.config(fg=self.accent_white)
+            self.entry2.insert(0, macro_str)
+        elif target == "Macro 3":
+            self.entry3.delete(0, tk.END)
+            self.entry3.config(fg=self.accent_white)
+            self.entry3.insert(0, macro_str)
+        elif target == "Macro 4":
+            self.entry4.delete(0, tk.END)
+            self.entry4.config(fg=self.accent_white)
+            self.entry4.insert(0, macro_str)
+
+        self.show_message(f"Set {target.lower()} to '{macro_str}'.", "success")
+
+    def send_macros(self):
+        if not self.com_port or not self.is_connected:
+            self.show_message("Device not connected.", "error")
+            return
+
+        try:
+            self.show_message("Sending macros…", "info")
+            self.master.update()
+
+            m1 = self.get_macro_value(self.entry1, "Macro 1 (Button 1)…")
+            m2 = self.get_macro_value(self.entry2, "Macro 2 (Button 2)…")
+            m3 = self.get_macro_value(self.entry3, "Macro 3 (Button 3)…")
+            m4 = self.get_macro_value(self.entry4, "Macro 4 (Encoder press)…")
+
+            with serial.Serial(self.com_port, 115200, timeout=2) as ser:
+                time.sleep(0.2)
+
+                for cmd in [
+                    f"SET1:{m1}",
+                    f"SET2:{m2}",
+                    f"SET3:{m3}",
+                    f"SET4:{m4}",
+                ]:
+                    ser.write((cmd + "\n").encode())
+                    time.sleep(0.1)
+                    print("Sent:", cmd)
+
+                time.sleep(0.3)
+                while ser.in_waiting > 0:
+                    response = (
+                        ser.readline()
+                        .decode("utf-8", errors="ignore")
+                        .strip()
+                    )
+                    print("ESP32:", response)
+
+            self.show_message("Macros sent successfully.", "success")
+
+        except Exception as e:
+            self.show_message(f"Failed to send macros: {e}", "error")
+            print("Error details:", e)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FloMacroPad(root)
+    root.mainloop()
