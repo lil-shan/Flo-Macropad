@@ -1,0 +1,312 @@
+#include <BleKeyboard.h>
+#include <Preferences.h>
+
+// ----- Pin configuration -----
+#define BTN_1      7       // Button 1
+#define BTN_2      8       // Button 2
+#define BTN_3      9       // Button 3
+#define ENC_CLK    5       // Encoder CLK
+#define ENC_DT     4       // Encoder DT
+#define ENC_SW     2       // Encoder push (Macro 4)
+
+// ----- BLE Keyboard -----
+BleKeyboard bleKeyboard("C3 MacroPad", "ESP32-C3", 100);
+
+// ----- Flash storage -----
+Preferences prefs;
+String macro1, macro2, macro3, macro4;
+
+// ----- Encoder state (interrupt-based) -----
+volatile long encoderPos = 0;   // updated in ISR
+long lastEncoderPos = 0;        // used in loop
+volatile int lastCLK = HIGH;    // last state of CLK (for ISR)
+
+// ----- Burst-based direction smoothing -----
+int lastDirection = 0;          // +1 for up, -1 for down, 0 = none yet
+unsigned long lastMoveTime = 0;
+const unsigned long DIRECTION_HOLD_MS = 500;   // gap to "reset" direction
+
+// ----- Encoder button debounce -----
+unsigned long lastButtonPress = 0;
+bool lastButtonState = HIGH;
+#define BUTTON_DEBOUNCE 250    // ms
+
+// ----- Button debounce for main buttons -----
+#define BTN_DELAY 200          // ms between macro fires
+
+// ----- Load macros from flash -----
+void loadMacros() {
+  // Defaults for testing
+  macro1 = prefs.getString("m1", "a");        // BTN1
+  macro2 = prefs.getString("m2", "b");        // BTN2
+  macro3 = prefs.getString("m3", "ctrl+c");   // BTN3
+  macro4 = prefs.getString("m4", "ctrl+v");   // ENCODER PRESS
+
+  Serial.println("Loaded Macros:");
+  Serial.println("  M1 = " + macro1);
+  Serial.println("  M2 = " + macro2);
+  Serial.println("  M3 = " + macro3);
+  Serial.println("  M4 = " + macro4);
+}
+
+// ----- Send macro via BleKeyboard -----
+// Syntax examples:
+//   "a", "hello", "ctrl+c", "ctrl+alt+del", "shift+a"
+void sendMacro(String seq) {
+  seq.trim();
+  seq.toLowerCase();
+
+  bool ctrl  = seq.indexOf("ctrl+")  >= 0;
+  bool alt   = seq.indexOf("alt+")   >= 0;
+  bool shift = seq.indexOf("shift+") >= 0;
+  bool win   = seq.indexOf("win+")   >= 0 || seq.indexOf("gui+") >= 0;  // handle win/gui
+
+  // Everything after the last '+' is treated as the "main" key
+  int plusIndex = seq.lastIndexOf('+');
+  String keyPart = (plusIndex >= 0) ? seq.substring(plusIndex + 1) : seq;
+  keyPart.trim();
+
+  Serial.print("Macro send: [");
+  Serial.print(seq);
+  Serial.print("] -> key[");
+  Serial.print(keyPart);
+  Serial.println("]");
+
+  if (!bleKeyboard.isConnected()) {
+    Serial.println("  (BLE not connected, skipping)");
+    return;
+  }
+
+  // Press modifiers first
+  if (ctrl)  bleKeyboard.press(KEY_LEFT_CTRL);
+  if (alt)   bleKeyboard.press(KEY_LEFT_ALT);
+  if (shift) bleKeyboard.press(KEY_LEFT_SHIFT);
+  if (win)   bleKeyboard.press(KEY_LEFT_GUI);   
+
+  // Now send the main key
+  if (keyPart == "enter") {
+    bleKeyboard.write(KEY_RETURN);
+  } else if (keyPart == "space") {
+    bleKeyboard.write(' ');
+  } else if (keyPart == "tab") {
+    bleKeyboard.write(KEY_TAB);
+  } else if (keyPart == "esc") {
+    bleKeyboard.write(KEY_ESC);
+  } else if (keyPart.startsWith("f") && keyPart.length() <= 3) {
+    // Optional: function keys f1..f12
+    int fn = keyPart.substring(1).toInt();
+    if (fn >= 1 && fn <= 12) {
+      bleKeyboard.write(KEY_F1 + (fn - 1));
+    }
+  } else if (keyPart == "win" || keyPart == "gui") {
+    // Allow a plain "win" macro that just opens the Start menu
+    bleKeyboard.press(KEY_LEFT_GUI);
+    delay(10);
+  } else if (keyPart.length() == 1) {
+    // Single character
+    bleKeyboard.write(keyPart.charAt(0));
+  } else if (keyPart.length() > 1) {
+    // e.g. "hello" → type each character
+    for (unsigned int i = 0; i < keyPart.length(); i++) {
+      bleKeyboard.write((uint8_t)keyPart[i]);
+      delay(5);
+    }
+  }
+
+  bleKeyboard.releaseAll();
+}
+
+
+// ----- Interrupt service routine for reading the encoder -----
+// This is the "classic" CLK+DT logic
+void IRAM_ATTR readEncoder() {
+  int currentCLK = digitalRead(ENC_CLK);
+
+  if (currentCLK != lastCLK) {
+    // If DT state is different from CLK state -> one direction
+    if (digitalRead(ENC_DT) != currentCLK) {
+      encoderPos++;   // "positive" direction
+    } else {
+      encoderPos--;   // "negative" direction
+    }
+  }
+
+  lastCLK = currentCLK;
+}
+
+// ----- Encoder Button (push) handler -----
+void handleEncoderButton() {
+  int buttonState = digitalRead(ENC_SW);
+  unsigned long currentTime = millis();
+
+  // Detect button press (HIGH to LOW transition)
+  if (lastButtonState == HIGH && buttonState == LOW) {
+    // Check debounce
+    if (currentTime - lastButtonPress > BUTTON_DEBOUNCE) {
+      lastButtonPress = currentTime;
+      Serial.println("Encoder button pressed!");
+      sendMacro(macro4);
+    }
+  }
+
+  lastButtonState = buttonState;
+}
+
+// ----- Setup -----
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  prefs.begin("macropad_new", false);
+  loadMacros();
+
+  pinMode(BTN_1,   INPUT_PULLUP);
+  pinMode(BTN_2,   INPUT_PULLUP);
+  pinMode(BTN_3,   INPUT_PULLUP);
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT,  INPUT_PULLUP);
+  pinMode(ENC_SW,  INPUT_PULLUP);
+
+  // Initialize encoder state
+  lastCLK = digitalRead(ENC_CLK);
+  lastButtonState = digitalRead(ENC_SW);
+
+  // Attach interrupt to CLK pin
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK), readEncoder, CHANGE);
+
+  bleKeyboard.begin();
+
+  Serial.println("\n=================================");
+  Serial.println("C3 MacroPad BLE HID ready!");
+  Serial.println("USB for config, BLE for macros");
+  Serial.println("=================================");
+  Serial.println("Commands over USB:");
+  Serial.println("  SET1:<macro>  (Button 1)");
+  Serial.println("  SET2:<macro>  (Button 2)");
+  Serial.println("  SET3:<macro>  (Button 3)");
+  Serial.println("  SET4:<macro>  (Encoder press)");
+  Serial.println("  HELLO         (handshake)");
+  Serial.println("  PRINT         (show macros)");
+  Serial.println("  TEST          (read pins)");
+  Serial.println("=================================\n");
+}
+
+// ----- Loop -----
+void loop() {
+  // --- USB Serial config & handshake ---
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.length() > 0) {
+      if (cmd == "HELLO") {
+        Serial.println("ESP32-C3-READY");
+      } else if (cmd.startsWith("SET1:")) {
+        macro1 = cmd.substring(5);
+        macro1.trim();
+        prefs.putString("m1", macro1);
+        Serial.println("Macro1 updated: " + macro1);
+      } else if (cmd.startsWith("SET2:")) {
+        macro2 = cmd.substring(5);
+        macro2.trim();
+        prefs.putString("m2", macro2);
+        Serial.println("Macro2 updated: " + macro2);
+      } else if (cmd.startsWith("SET3:")) {
+        macro3 = cmd.substring(5);
+        macro3.trim();
+        prefs.putString("m3", macro3);
+        Serial.println("Macro3 updated: " + macro3);
+      } else if (cmd.startsWith("SET4:")) {
+        macro4 = cmd.substring(5);
+        macro4.trim();
+        prefs.putString("m4", macro4);
+        Serial.println("Macro4 updated: " + macro4);
+      } else if (cmd == "PRINT") {
+        Serial.println("\nCurrent macros:");
+        Serial.println("  m1 = " + macro1);
+        Serial.println("  m2 = " + macro2);
+        Serial.println("  m3 = " + macro3);
+        Serial.println("  m4 = " + macro4);
+        Serial.println();
+      } else if (cmd == "TEST") {
+        Serial.println("\nTesting pins...");
+        Serial.print("BTN1: "); Serial.println(digitalRead(BTN_1));
+        Serial.print("BTN2: "); Serial.println(digitalRead(BTN_2));
+        Serial.print("BTN3: "); Serial.println(digitalRead(BTN_3));
+        Serial.print("ENC_CLK: "); Serial.println(digitalRead(ENC_CLK));
+        Serial.print("ENC_DT: ");  Serial.println(digitalRead(ENC_DT));
+        Serial.print("ENC_SW: ");  Serial.println(digitalRead(ENC_SW));
+        Serial.print("BLE Connected: "); Serial.println(bleKeyboard.isConnected());
+        Serial.println();
+      } else {
+        Serial.println("Unknown cmd: " + cmd);
+      }
+    }
+  }
+
+  // --- Handle encoder button (push) ---
+  handleEncoderButton();
+
+  // --- Handle encoder rotation (burst-based direction lock) ---
+  long posCopy = encoderPos;              // copy volatile once
+  long rawDiff = posCopy - lastEncoderPos;
+
+  if (rawDiff != 0 && bleKeyboard.isConnected()) {
+    unsigned long now = millis();
+    int currentSign = (rawDiff > 0) ? 1 : -1;
+    int steps = abs(rawDiff);
+
+    // Check if this is a new burst (gap > 500ms) → allow direction change
+    if (lastDirection == 0 || (now - lastMoveTime) > DIRECTION_HOLD_MS) {
+      lastDirection = currentSign;   // start new burst with this direction
+    } else {
+      // Still in same burst → force sign to previous direction
+      currentSign = lastDirection;
+    }
+
+    lastMoveTime = now;
+    lastEncoderPos = posCopy;
+
+    if (currentSign > 0) {
+      // Treat whole burst as "volume up"
+      for (int i = 0; i < steps; i++) {
+        Serial.println("Encoder BURST: UP");
+        bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
+        delay(2);
+      }
+    } else {
+      // Treat whole burst as "volume down"
+      for (int i = 0; i < steps; i++) {
+        Serial.println("Encoder BURST: DOWN");
+        bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
+        delay(2);
+      }
+    }
+  }
+
+  // --- BLE HID operations (regular buttons) ---
+  if (bleKeyboard.isConnected()) {
+    // Button 1
+    if (digitalRead(BTN_1) == LOW) {
+      Serial.println("Button 1 pressed!");
+      sendMacro(macro1);
+      delay(BTN_DELAY);
+    }
+
+    // Button 2
+    if (digitalRead(BTN_2) == LOW) {
+      Serial.println("Button 2 pressed!");
+      sendMacro(macro2);
+      delay(BTN_DELAY);
+    }
+
+    // Button 3
+    if (digitalRead(BTN_3) == LOW) {
+      Serial.println("Button 3 pressed!");
+      sendMacro(macro3);
+      delay(BTN_DELAY);
+    }
+  }
+
+  delay(2);  // Small delay for stability
+}
